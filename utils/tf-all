@@ -1,0 +1,260 @@
+#!/bin/bash
+
+# Vars
+PRODUCTS=()
+VARINIT="varInitScript.sh"
+TF=$(which terraform)
+DELAY=0 # default delay of 0 seconds between products
+DELAYASK=1 # Ask for delay be default.  can be overriden with the -d flag
+GETIPS_ASK=1
+GETORDER=1
+INTERACTIVE=1
+NONINTERACTVE=0
+
+# terraform Functions
+function tf_init() {
+  $TF init
+}
+
+function tf_get () {
+  $TF get -update=true
+}
+
+function tf_plan () {
+  $TF plan
+}
+
+function tf_apply () {
+  $TF apply
+  # TODO:  add api checks for completion
+}
+
+function tf_destroy () {
+  $TF destroy
+}
+
+function tf_validate () {
+  $TF validate
+}
+
+# aws scripts/fuctions
+function find_getips_script () {
+  if [[ $GETIPS_ASK == 1 ]]; then
+    GET_AWS_IPS=$(which get-aws-ips)
+  fi
+  if [[ -z $GET_AWS_IPS ]]; then
+    echo "No get-aws-ips script specified or found"
+    read -p "enter path to the get-aws-ips script [Enter with no input will exit]: " GET_AWS_IPS
+    if [[ -z $GET_AWS_IPS ]] || [[ ! -x $GET_AWS_IPS ]]; then
+      echo "no valid get_aws_ips script, exiting"
+      exit 1
+    fi
+  else
+    echo "I found the get-aws-ips script ( ${GET_AWS_IPS} )"
+    if [[ $INTERACTIVE == 1 ]]; then
+      read -p "enter path to script if this is incorrect [Press Enter to accept found instance]: " getips_user_input
+      if [[ -n $getips_user_input ]] && [[ -x $getips_user_input ]]; then
+        GET_AWS_IPS=${getips_user_input}
+      elif [[ -n $getips_user_input ]] && [[ ! -x $getips_user_input ]]; then
+        echo "${getips_user_input} is not executable, exiting"
+        exit 1
+      fi
+    elif [[ $NONINTERACTIVE == 1 ]]; then
+      echo "Non interactive selected on the command line, proceeding with ${GET_AWS_IPS}"
+    fi
+  fi
+}
+
+function getips () {
+  # run get-aws-ips in each directory
+  $GET_AWS_IPS -y
+}
+
+function show_help() {
+cat << EOF
+Usage: $0 [-hiy] [-e varscript] [-d delay_in_seconds] <ENVIRONMENT> <ACTION>
+  -h                      Print this help
+  -y                      run non-interactively and assume all input is given to run
+                          (will run interactively by default)
+  -g <get-aws-ips script> which get-aws-ips script to use if not get-aws-ips or it isn't in your \$PATH
+  -e <AWS vars script>    if you have a different shell init script for AWS ENV vars, default is varInitScript.sh
+  -d <delay in seconds>   delay in seconds between a terraform apply for each product
+  -p <product name>       Enter product name.  This option can be used multiple times for multple products and will put the products in the order they are presented on the command line
+  ENVIRONMENT must be a valid environment dir in the current directory
+  ACTION can be one of:  init, update, plan, apply, destroy, validate, getips
+
+  tf-all init should be run fist on any new repo/stack as starting with terraform 0.10.0 the providers are loaded this way
+EOF
+}
+
+# getopts loop for flags and remove flag options from $ARGS
+
+# getopts
+# reset OPTIND
+OPTIND=1
+
+while getopts "hye:d:g:p:" opt; do
+  case "$opt" in
+    h)
+      show_help
+      exit 0
+      ;;
+    y)
+      INTERACTIVE=0
+      NONINTERACTIVE=1
+      ;;
+    e)
+      VARINIT=$OPTARG
+      ;;
+    g)
+      GET_AWS_IPS=$OPTARG
+      GETIPS_ASK=0
+      ;;
+    d)
+      DELAY=$OPTARG
+      DELAYASK=0
+      ;;
+    p)
+      GETORDER=0
+      PRODUCTS+=($OPTARG)
+      ;;
+  esac
+done
+shift "$((OPTIND-1))" # Shift off the options and optional --
+
+# Get all environment dirs in $PWD
+ENV_DIRS=();
+for name in $(ls); do
+  if [[ -d $name ]]; then
+    ENV_DIRS+=($name)
+  fi
+done
+
+# check for proper number of args
+if [[ ! $# -eq 2 ]]; then
+  show_help
+  exit 1
+fi
+
+# check for existing env dir as arg $1
+if [[ "${ENV_DIRS[@]}" =~ "${1}" ]]; then
+  ENV=${1}
+else
+  echo "$1 is not a valid environment"
+  show_help
+  exit 1
+fi
+
+# check for supported Terraform arguments in arg $2
+if [[ "$2" =~ (init|update|plan|apply|validate|destroy|getips) ]]; then
+  ACTION=${2}
+else
+  show_help
+  exit 1
+fi
+
+if [[ -f ${VARINIT} ]]; then
+  source ${VARINIT}
+elif [[ -z $TF_VAR_aws_account ]] || [[ -z $TF_VAR_aws_named_profile ]] || [[ -z $TF_VAR_aws_key ]]; then
+  echo "at least one of TF_VAR_aws_account, TF_VAR_aws_named_profile, or TF_VAR_aws_key are not set and no ${VARINIT}"
+  echo "cannot proceed with out the ${VARINIT} or those three ENV vars set"
+  exit 1
+fi
+
+# cd into environment dir
+cd $ENV
+
+# Get products
+if [[ $GETORDER == 1 ]]; then
+  for P in $(ls); do
+    if [[ -d $P ]]; then
+      PRODUCTS+=($P)
+    fi
+  done
+fi
+
+# Present found products for order
+P_LEN=${#PRODUCTS[@]}
+i=0
+echo "PRODUCTS in order discovered"
+while [[ $i -lt $P_LEN ]]; do
+  echo "${i}: ${PRODUCTS[$i]}"
+  i=$(($i+1))
+done
+if [[ $GETORDER == 1 ]]; then
+  read -p "Please enter new order by the index numbers or [Enter] to accept this order: " -a ORDER
+fi
+if [[ $ORDER == "" ]]; then
+  ORDER=$(seq 0 $(($P_LEN-1)))
+fi
+# Order of products
+echo "order products will be run"
+for i in ${ORDER[@]}; do
+  echo "PRODUCT #${i}: ${PRODUCTS[$i]}"
+done
+
+# Delay between products for apply
+
+if [[ $ACTION == "apply" ]]; then
+  if [[ $DELAYASK == 1 ]]; then
+    read -p "Enter delay between products (Default: ${DELAY}): " DELAY
+    if [[ -z $DELAY ]]; then
+      DELAY=0
+    fi
+  fi
+  echo "using delay:  ${DELAY}"
+fi
+
+if [[ $ACTION == "getips" ]]; then
+  find_getips_script
+fi
+
+for product_index in ${ORDER[@]}; do
+  product_dir=${PRODUCTS[$product_index]}
+  echo $product_dir
+  case $ACTION in
+    init )
+      cd $product_dir
+      tf_init
+      cd ../
+      ;;
+    update )
+      cd $product_dir
+      tf_init
+      tf_get
+      cd ../
+      ;;
+    plan )
+      cd $product_dir
+      tf_init
+      tf_get
+      tf_plan
+      cd ../
+      ;;
+    apply )
+      cd $product_dir
+      tf_apply
+      echo "Sleeping for ${DELAY}"
+      sleep $DELAY
+      cd ../
+      ;;
+    destroy )
+      cd $product_dir
+      tf_destroy
+      cd ../
+      ;;
+    validate )
+      cd $product_dir
+      tf_validate
+      cd ../
+      ;;
+    getips )
+      cd $product_dir
+      getips
+      cd ../
+      ;;
+  esac
+done
+
+# Back up one dir again before exiting
+cd ../

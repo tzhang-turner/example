@@ -1,0 +1,156 @@
+#!/bin/bash
+#
+# Queries AWS via the CLI to get Private IP Addresses of 
+# Auto Scale Groups or individual instances
+# 
+# Run from directory containing your current ".tfstate" file
+
+TFSTATE="./terraform.tfstate"
+ASG_IDS=""
+EC2_INSTANCE_IDS=""
+TFOPTION=0
+PROFILE_OPTION=0
+INTERACTIVE=1
+NONINTERACTIVE=0
+
+# define functions
+function get_aws_info() {
+  if [[ -e $TFSTATE ]]; then
+    ASG_IDS=$(cat ${TFSTATE} |jq '.modules[].resources[] | select(.type == "aws_autoscaling_group") |.primary.id' |tr -d '"')
+    if [[ -n $ASG_IDS ]]; then
+      echo -e "ASG ID(s) found:\n\t$ASG_IDS"
+    else
+      echo "Couldn't find ASG instance ID(s)"
+    fi
+
+    EC2_INSTANCE_IDS=$(cat ${TFSTATE} |jq '.modules[].resources[] | select(.type == "aws_instance") |.primary.id' |tr -d '"')
+    if [[ -n $EC2_INSTANCE_IDS ]]; then
+      echo -e "Individual EC2 Instance ID(s) found (non-ASG):\n$EC2_INSTANCE_IDS"
+    fi
+
+    EC2_ELBS=$(cat ${TFSTATE} |jq '.modules[].resources[] | select(.type == "aws_elb") |.primary.attributes.dns_name' |tr -d '"')
+    if [ -n "$EC2_ELBS" ]; then
+      echo -e "\nEC2 ELB(s) found:"
+      for EC2_ELB in $EC2_ELBS; do
+        echo -e "ELB DNS Name: $EC2_ELB"
+      done
+    fi
+  fi
+
+  for ASG_ID in $ASG_IDS; do
+   echo -e "\nASG: $ASG_ID"
+   [ -n "$AWS_REGION" ] && region="--region $AWS_REGION"
+   INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups --profile $AWS_PROFILE $region --auto-scaling-group-names $ASG_ID |jq '.AutoScalingGroups[].Instances[].InstanceId' |tr -d '"')
+   for INSTANCE_ID in $INSTANCE_IDS; do
+     INSTANCE_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --profile $AWS_PROFILE $region| jq '.Reservations[].Instances[].NetworkInterfaces[].PrivateIpAddress' |tr -d '"')
+     echo "$INSTANCE_ID has ip: $INSTANCE_IP"
+   done
+  done 
+
+  #non-ASG instances
+  for INSTANCE_ID in $EC2_INSTANCE_IDS; do
+    INSTANCE_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --profile $AWS_PROFILE $region| jq '.Reservations[].Instances[].NetworkInterfaces[].PrivateIpAddress' |tr -d '"')
+    echo "$INSTANCE_ID has ip: $INSTANCE_IP"
+  done
+}
+
+function show_help() {
+cat << EOF
+Usage: $0 [-hiy] [-t <tfstate filename>] [-p <aws_profile_name>]
+  -h                Print this help
+  -i                Interactive mode (does not work with -y)
+  -y                Just answer yes to all prompts (does not work with -i)
+  -t <tfstate>      explicitly state what .tfstate file to use
+  -p <aws_profile>  Define what AWS profile to use
+  if no options are given it defaults to the -i Interactive behavior
+EOF
+}
+
+# getopts
+# reset OPTIND
+OPTIND=1
+
+while getopts "hiyt:p:" opt; do
+  case "$opt" in
+    h) 
+      show_help
+      exit 0
+      ;;
+    i)
+      INTERACTIVE=1
+      NONINTERACTIVE=0
+      ;;
+    y)
+      INTERACTIVE=0
+      NONINTERACTIVE=1
+      ;;
+    t)
+      TFSTATE=$OPTARG
+      TFOPTION=1
+      ;;
+    p)
+      AWS_PROFILE=$OPTARG
+      PROFILE_OPTION=1
+      ;;
+  esac
+done
+shift "$((OPTIND-1))" # Shift off the options and optional --
+
+# make sure we don't have -i and -y
+if [[ $INTERACTIVE == 1 ]] && [[ $NONINTERACTIVE == 1 ]]; then
+  echo "you CANNOT set the -i and -y flags at the same time.  Only one OR the other"
+  exit 1
+fi
+
+# get AWS named profile unless option is set on command line
+if [[ $PROFILE_OPTION == 0 ]]; then
+  if [[ -z $TF_VAR_aws_named_profile ]] && [[ $INTERACTIVE == 1 ]]; then 
+    read -p "Enter AWS Profile: " AWS_PROFILE
+    echo "Using Named profile: ${AWS_PROFILE}"
+  elif [[ -n $TF_VAR_aws_named_profile ]] && [[ $INTERACTIVE == 1 ]]; then
+    read -p "Use AWS Profile: $TF_VAR_aws_named_profile? (y) " var
+    if [[ $var == "y" ]] || [[ $var == "" ]]; then
+      AWS_PROFILE=$TF_VAR_aws_named_profile
+      echo "Using Named profile: ${AWS_PROFILE}"
+    else
+      read -p "Enter AWS Profile: " AWS_PROFILE
+      echo "Using Named profile: ${AWS_PROFILE}"
+    fi
+  elif [[ -z $TF_VAR_aws_named_profile ]] && [[ $NONINTERACTIVE == 1 ]]; then 
+    echo "\$TF_VAR_aws_named_profile is unset, cannot proceed in non-interactive mode"
+    exit 1
+  elif [[ -n $TF_VAR_aws_named_profile ]] && [[ $NONINTERACTIVE == 1 ]]; then 
+    AWS_PROFILE=${TF_VAR_aws_named_profile}
+    echo "Using profile ${AWS_PROFILE}"
+  fi
+elif [[ $PROFILE_OPTION == 1 ]]; then
+    echo "Using profile ${AWS_PROFILE} as set by -p flag"
+fi
+
+# tfstate file or list of instance IDs
+if [[ $TFOPTION == 0 ]]; then
+  if [[ $INTERACTIVE == 1 ]] && [[ -e $TFSTATE ]]; then
+    read -p "Use a terrafrom state file ${TFSTATE}? (y)" var
+    if [[ $var == "y" ]] || [[ $var == "" ]]; then
+      get_aws_info
+    fi
+  elif [[ $INTERACTIVE == 1 ]] && [[ ! -e $TFSTATE ]]; then
+    read -p "Please enter ASG ID(s): " -a ASG_IDS
+    read -p "Please enter Instance ID(s): " -a EC2_INSTANCE_IDS
+    get_aws_info
+  elif [[ $NONINTERACTIVE == 1 ]] && [[ -e $TFSTATE ]]; then
+    get_aws_info
+  elif [[ $NONINTERACTIVE == 1 ]] && [[ ! -e $TFSTATE ]]; then
+    echo "cannot find ${TFSTATE}, exiting"
+    exit 1
+  fi
+elif [[ $TFOPTION == 1 ]] && [[ -e $TFSTATE ]]; then
+  echo "USING ${TFSTATE} as set by -t option"
+  get_aws_info
+else
+  echo "Cannot find ${TFSTATE}, exiting"
+  exit 1
+fi
+
+echo
+exit 0
